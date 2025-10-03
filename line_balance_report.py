@@ -2,6 +2,26 @@
 #!/usr/bin/env python3
 import argparse, os
 from collections import defaultdict, deque
+
+def get_course_sections_on_line(long_df, course, line):
+    """Return the list of distinct class codes (sections) for a course on a given line."""
+    mask = (long_df["Course"] == course) & (long_df["Line"] == line)
+    return sorted(long_df.loc[mask, "Class"].dropna().astype(str).unique().tolist())
+
+def pick_destination_section(long_df, course, line):
+    """Pick the least-filled class section (Class code) for the course on the target line."""
+    sections = get_course_sections_on_line(long_df, course, line)
+    if not sections:
+        return None
+    counts = (
+        long_df[(long_df["Course"] == course) & (long_df["Line"] == line)]
+        .groupby("Class")
+        .size()
+        .reindex(sections, fill_value=0)
+    )
+    dest_class = counts.sort_values(kind="mergesort").index[0]
+    return dest_class
+
 from io import BytesIO
 import pandas as pd
 from docx import Document
@@ -121,7 +141,14 @@ def compute_multi_move_plan_constrained(long_df, max_rounds=100, max_moves_per_s
                             sched[student].pop(src_ln, None)
                             sched[student][dst_ln] = c
                             mask = (long_df['Code']==student) & (long_df['Course']==c) & (long_df['Line']==src_ln)
-                            long_df.loc[mask, 'Line'] = dst_ln
+                            # Assign to specific destination section to preserve separate classes
+dest_class = pick_destination_section(long_df, c, dst_ln)
+if dest_class is None:
+    valid = False
+    break
+long_df.loc[mask, 'Line'] = dst_ln
+long_df.loc[mask, 'Class'] = dest_class
+
                             moves.append({'StudentCode': student, 'Course': c, 'FromLine': src_ln, 'ToLine': dst_ln})
                             moved_sc.add((student, c))
                             student_move_counts[student] += 1
@@ -161,6 +188,7 @@ def write_docx(moves_df, impact_df, out_path):
     doc.add_heading("Student Move Suggestions & Impact Summary", level=1)
     impact_sorted = impact_df.sort_values(['Course','Line']).reset_index(drop=True)
     ranges_df = build_ranges_from_impact(impact_sorted)
+    ranges_df_filtered = ranges_df[(ranges_df['RangeBefore'] > 0) | (ranges_df['RangeAfter'] > 0)].reset_index(drop=True)
     total_moves = len(moves_df)
     courses_improved = int((ranges_df['Improvement'] > 0).sum())
     avg_improvement = float(ranges_df.loc[ranges_df['Improvement'] > 0, 'Improvement'].mean()) if courses_improved > 0 else 0.0
@@ -168,7 +196,7 @@ def write_docx(moves_df, impact_df, out_path):
     for item in [f"Total moves proposed: {total_moves}", f"Courses with improved balance: {courses_improved}", f"Average improvement in course range: {avg_improvement:.1f}"]:
         doc.add_paragraph(item, style="List Bullet")
     doc.add_heading("Courses Still Unbalanced (Range > 3 After Moves)", level=2)
-    alert_df = ranges_df[ranges_df['RangeAfter'] > 3].sort_values('RangeAfter', ascending=False)
+    alert_df = ranges_df_filtered[ranges_df_filtered['RangeAfter'] > 3].sort_values('RangeAfter', ascending=False)
     if not alert_df.empty:
         table = doc.add_table(rows=1, cols=3)
         hdr = table.rows[0].cells; hdr[0].text="Course"; hdr[1].text="Range After"; hdr[2].text="Range Before"

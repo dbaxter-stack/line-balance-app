@@ -2,6 +2,27 @@
 import streamlit as st
 import pandas as pd
 from collections import defaultdict, deque
+
+def get_course_sections_on_line(long_df, course, line):
+    """Return the list of distinct class codes (sections) for a course on a given line."""
+    mask = (long_df["Course"] == course) & (long_df["Line"] == line)
+    return sorted(long_df.loc[mask, "Class"].dropna().astype(str).unique().tolist())
+
+def pick_destination_section(long_df, course, line):
+    """Pick the least-filled class section (Class code) for the course on the target line."""
+    sections = get_course_sections_on_line(long_df, course, line)
+    if not sections:
+        return None  # No section exists on that line for this course
+    counts = (
+        long_df[(long_df["Course"] == course) & (long_df["Line"] == line)]
+        .groupby("Class")
+        .size()
+        .reindex(sections, fill_value=0)
+    )
+    # Choose the section with the smallest count; tie-break by name
+    dest_class = counts.sort_values(kind="mergesort").index[0]
+    return dest_class
+
 from io import BytesIO
 
 # Word export
@@ -139,7 +160,15 @@ def compute_multi_move_plan_constrained(long_df, max_rounds=100, max_moves_per_s
                             sched[student].pop(src_ln, None)
                             sched[student][dst_ln] = c
                             mask = (long_df["Code"]==student) & (long_df["Course"]==c) & (long_df["Line"]==src_ln)
-                            long_df.loc[mask, "Line"] = dst_ln
+                            # Assign to a specific destination section (keep sections separate)
+dest_class = pick_destination_section(long_df, c, dst_ln)
+if dest_class is None:
+    # If no section exists (shouldn't happen if we only move between existing lines), skip this chain
+    valid = False
+    break
+long_df.loc[mask, "Line"] = dst_ln
+long_df.loc[mask, "Class"] = dest_class
+
                             moves.append({"StudentCode": student, "Course": c, "FromLine": src_ln, "ToLine": dst_ln})
                             moved_sc.add((student, c))
                             student_move_counts[student] += 1
@@ -168,6 +197,7 @@ def build_ranges_from_impact(impact_df):
     return pd.DataFrame(rows).sort_values("Improvement", ascending=False).reset_index(drop=True)
 
 def docx_from_reports(moves_df, impact_df) -> bytes:
+    # Per-course table will include only courses with positive range; ranges computed ignoring zeros
     """Build a readable Word doc with summary, alerts (RangeAfter>3), and student-grouped moves; return bytes."""
     doc = Document()
     doc.add_heading("Student Move Suggestions & Impact Summary", level=1)
@@ -175,6 +205,7 @@ def docx_from_reports(moves_df, impact_df) -> bytes:
     # Impact summary
     impact_sorted = impact_df.sort_values(["Course","Line"]).reset_index(drop=True)
     ranges_df = build_ranges_from_impact(impact_sorted)
+    ranges_df_filtered = ranges_df[(ranges_df['RangeBefore'] > 0) | (ranges_df['RangeAfter'] > 0)].reset_index(drop=True)
     total_moves = len(moves_df)
     courses_improved = int((ranges_df["Improvement"] > 0).sum())
     avg_improvement = float(ranges_df.loc[ranges_df["Improvement"] > 0, "Improvement"].mean()) if courses_improved > 0 else 0.0
@@ -190,7 +221,7 @@ def docx_from_reports(moves_df, impact_df) -> bytes:
 
     # Alerts
     doc.add_heading("Courses Still Unbalanced (Range > 3 After Moves)", level=2)
-    alert_df = ranges_df[ranges_df["RangeAfter"] > 3].sort_values("RangeAfter", ascending=False)
+    alert_df = ranges_df_filtered[ranges_df_filtered["RangeAfter"] > 3].sort_values("RangeAfter", ascending=False)
     if not alert_df.empty:
         table = doc.add_table(rows=1, cols=3)
         hdr = table.rows[0].cells
