@@ -2,9 +2,13 @@
 import streamlit as st
 import pandas as pd
 from collections import defaultdict, deque
+from io import BytesIO
+
+# Word export
+from docx import Document
 
 st.set_page_config(page_title="Line Balance Reports", layout="wide")
-st.title("📊 Line Balance Reports (Courses × Lines) — v2")
+st.title("📊 Line Balance Reports (Courses × Lines) — v3")
 
 uploaded = st.file_uploader("Upload Student Allocations CSV (must include 'Code' and AL1..)", type=["csv"])
 
@@ -150,6 +154,76 @@ def compute_multi_move_plan_constrained(long_df, max_rounds=100, max_moves_per_s
                 break
     return pd.DataFrame(moves), long_df
 
+def df_to_csv(df):
+    return df.to_csv(index=False).encode("utf-8")
+
+def build_ranges_from_impact(impact_df):
+    rows = []
+    for course, grp in impact_df.groupby("Course"):
+        b = grp[grp["Before"] > 0].groupby("Course")["Before"].agg(["min","max"])
+        a = grp[grp["After"] > 0].groupby("Course")["After"].agg(["min","max"])
+        rng_b = int(b["max"].iloc[0] - b["min"].iloc[0]) if not b.empty else 0
+        rng_a = int(a["max"].iloc[0] - a["min"].iloc[0]) if not a.empty else 0
+        rows.append({"Course": course, "RangeBefore": rng_b, "RangeAfter": rng_a, "Improvement": rng_b - rng_a})
+    return pd.DataFrame(rows).sort_values("Improvement", ascending=False).reset_index(drop=True)
+
+def docx_from_reports(moves_df, impact_df) -> bytes:
+    """Build a readable Word doc with summary, alerts (RangeAfter>3), and student-grouped moves; return bytes."""
+    doc = Document()
+    doc.add_heading("Student Move Suggestions & Impact Summary", level=1)
+
+    # Impact summary
+    impact_sorted = impact_df.sort_values(["Course","Line"]).reset_index(drop=True)
+    ranges_df = build_ranges_from_impact(impact_sorted)
+    total_moves = len(moves_df)
+    courses_improved = int((ranges_df["Improvement"] > 0).sum())
+    avg_improvement = float(ranges_df.loc[ranges_df["Improvement"] > 0, "Improvement"].mean()) if courses_improved > 0 else 0.0
+
+    p = doc.add_paragraph("Quick Summary")
+    p.runs[0].bold = True
+    for item in [
+        f"Total moves proposed: {total_moves}",
+        f"Courses with improved balance: {courses_improved}",
+        f"Average improvement in course range: {avg_improvement:.1f}",
+    ]:
+        doc.add_paragraph(item, style="List Bullet")
+
+    # Alerts
+    doc.add_heading("Courses Still Unbalanced (Range > 3 After Moves)", level=2)
+    alert_df = ranges_df[ranges_df["RangeAfter"] > 3].sort_values("RangeAfter", ascending=False)
+    if not alert_df.empty:
+        table = doc.add_table(rows=1, cols=3)
+        hdr = table.rows[0].cells
+        hdr[0].text = "Course"
+        hdr[1].text = "Range After"
+        hdr[2].text = "Range Before"
+        for _, r in alert_df.iterrows():
+            row = table.add_row().cells
+            row[0].text = str(r["Course"])
+            row[1].text = str(int(r["RangeAfter"]))
+            row[2].text = str(int(r["RangeBefore"]))
+    else:
+        doc.add_paragraph("All courses balanced within a range of 3.")
+
+    # Student group
+    doc.add_heading("Student Moves (Grouped by StudentCode)", level=2)
+    if not moves_df.empty:
+        msort = moves_df.sort_values(["StudentCode","Course","FromLine","ToLine"]).reset_index(drop=True)
+        cur = None
+        for _, r in msort.iterrows():
+            stud = str(r["StudentCode"]); c = str(r["Course"]); fr = str(r["FromLine"]); to = str(r["ToLine"])
+            if stud != cur:
+                doc.add_heading(stud, level=3)
+                cur = stud
+            doc.add_paragraph(f"{c}: {fr} \u2192 {to}", style="List Bullet")
+    else:
+        doc.add_paragraph("No moves proposed.")
+
+    buf = BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    return buf.read()
+
 if uploaded is not None:
     df = pd.read_csv(uploaded)
     long = melt_long(df)
@@ -180,15 +254,18 @@ if uploaded is not None:
     impact = impact.sort_values(["Course","Line"]).reset_index(drop=True)
     st.dataframe(impact)
 
-    def df_to_csv(df):
-        return df.to_csv(index=False).encode("utf-8")
-
-    c1, c2, c3 = st.columns(3)
+    # Downloads
+    c1, c2, c3, c4 = st.columns(4)
     with c1:
-        st.download_button("Download Imbalanced Courses (CSV)", data=df_to_csv(imbalance), file_name="imbalanced_courses.csv")
+        st.download_button("Imbalanced Courses (CSV)", data=df_to_csv(imbalance), file_name="imbalanced_courses.csv")
     with c2:
-        st.download_button("Download Move Suggestions (CSV)", data=df_to_csv(moves), file_name="move_suggestions.csv")
+        st.download_button("Move Suggestions (CSV)", data=df_to_csv(moves), file_name="move_suggestions.csv")
     with c3:
-        st.download_button("Download Before-After Impact (CSV)", data=df_to_csv(impact), file_name="before_after_impact.csv")
+        st.download_button("Before-After Impact (CSV)", data=df_to_csv(impact), file_name="before_after_impact.csv")
+    with c4:
+        # Build docx bytes on the fly
+        docx_bytes = docx_from_reports(moves, impact)
+        st.download_button("Word Report (.docx)", data=docx_bytes, file_name="Student_Move_Suggestions_Report.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+
 else:
     st.info("Upload a CSV to start.")
