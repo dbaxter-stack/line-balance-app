@@ -1,290 +1,185 @@
 
 #!/usr/bin/env python3
-"""
-Line Balance Report Generator
-
-Generates three reports from a student allocations export (CSV):
-1) Imbalanced courses (ignoring zeros, requiring appearances in >= min_lines)
-2) Student-by-student move suggestions to balance courses across lines (same course only)
-3) Before/After impact of the suggested moves on each course/line
-
-Usage:
-    python line_balance_report.py --input "StudentAllocations-Lines-Export (15).csv" --outdir ./out
-
-Requirements:
-    - Python 3.8+
-    - pandas, numpy, openpyxl (for Excel export)
-
-Notes:
-    - "Course" is derived from the first five characters of the class code (e.g., "12ENG").
-    - Lines are identified by columns whose names start with "AL" (e.g., AL1..AL6).
-    - Move suggestions re-distribute students from surplus lines to deficit lines of the SAME course only.
-"""
-
 import argparse
-import os
-import sys
-from collections import deque, defaultdict
-from typing import Dict, List, Tuple
-
-import numpy as np
+from collections import defaultdict, deque
 import pandas as pd
 
+def counts_from_long(long_df):
+    return long_df.groupby(['Line','Course']).size().reset_index(name='StudentCount')
 
-def load_allocations(path: str) -> pd.DataFrame:
-    df = pd.read_csv(path)
-    # Identify allocation columns (lines)
-    alloc_cols = [c for c in df.columns if str(c).startswith("AL")]
-    if not alloc_cols:
-        raise ValueError("No line columns found. Expected columns that start with 'AL' (e.g., AL1, AL2...).")
-    # Long format
-    long = df.melt(
-        id_vars=[c for c in df.columns if c not in alloc_cols],
-        value_vars=alloc_cols,
-        var_name="Line",
-        value_name="Class"
-    )
-    long = long.dropna(subset=["Class"]).copy()
-    # Derive course (first 5 chars)
-    long["Course"] = long["Class"].astype(str).str[:5]
-    # Ensure we have a student identifier column named 'Code'
-    if "Code" not in long.columns:
-        raise ValueError("Expected a 'Code' column to identify students.")
-    return long, alloc_cols
+def build_offerings(long_df):
+    counts = counts_from_long(long_df)
+    wide = counts.pivot(index='Course', columns='Line', values='StudentCount')
+    course_to_lines = {course: [ln for ln, ct in row.dropna().items() if ct > 0] for course, row in wide.iterrows()}
+    return wide, course_to_lines
 
+def build_student_schedule(long_df):
+    sched = defaultdict(dict)
+    for _, r in long_df.iterrows():
+        sched[r['Code']][r['Line']] = r['Course']
+    return sched
 
-def count_by_course_line(long: pd.DataFrame) -> pd.DataFrame:
-    counts = long.groupby(["Line", "Course"]).size().reset_index(name="StudentCount")
-    return counts
-
-
-def compute_imbalance(counts: pd.DataFrame, ignore_zeros: bool = True, min_lines: int = 2) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Returns:
-        wide_counts: pivot table (Course x Line) with counts (NaN when absent)
-        imbalance: DataFrame with columns [Course, Range, Max, Min, OfferingLines, AppearsIn]
-    """
-    wide = counts.pivot(index="Course", columns="Line", values="StudentCount")
-    # Prepare nonzero stats
+def compute_imbalance(wide):
     rows = []
     for course, row in wide.iterrows():
         vals = row.dropna()
-        if ignore_zeros:
-            nz = vals[vals > 0]
-        else:
-            nz = vals.fillna(0)
-        appears_in = int((vals > 0).sum())
-        if ignore_zeros and appears_in < min_lines:
-            # skip courses that don't appear in at least min_lines lines
+        nz = vals[vals>0]
+        appears_in = int((vals>0).sum())
+        if appears_in < 2:
             continue
-        if ignore_zeros:
-            if len(nz) == 0:
+        if len(nz) >= 2:
+            rng = float(nz.max()-nz.min())
+            rows.append({'Course': course, 'Range': rng})
+    imb = pd.DataFrame(rows).sort_values(['Range','Course'], ascending=[False, True]).reset_index(drop=True)
+    return imb
+
+def plan_student_chain(student, course, from_ln, to_ln, sched, offerings, depth=2):
+    if to_ln not in sched[student]:
+        return [(course, from_ln, to_ln)]
+    if depth == 0:
+        return None
+    blocking_course = sched[student][to_ln]
+    for alt_ln in offerings.get(blocking_course, []):
+        if alt_ln == to_ln or alt_ln in sched[student]:
+            continue
+        return [(blocking_course, to_ln, alt_ln), (course, from_ln, to_ln)]
+    if depth > 1:
+        for alt_ln in offerings.get(blocking_course, []):
+            if alt_ln == to_ln:
                 continue
-            if len(nz) == 1:
-                rng = 0
-                mx = nz.max()
-                mn = nz.min()
-            else:
-                rng = float(nz.max() - nz.min())
-                mx = float(nz.max())
-                mn = float(nz.min())
-        else:
-            rng = float(nz.max() - nz.min())
-            mx = float(nz.max())
-            mn = float(nz.min())
-        rows.append({
-            "Course": course,
-            "Range": rng,
-            "Max": mx,
-            "Min": mn,
-            "OfferingLines": ",".join([c for c, v in vals.items() if v > 0]),
-            "AppearsIn": appears_in
-        })
-    imbalance = pd.DataFrame(rows).sort_values(["Range", "Course"], ascending=[False, True]).reset_index(drop=True)
-    return wide, imbalance
+            if alt_ln not in sched[student]:
+                continue
+            c2 = sched[student][alt_ln]
+            for alt2 in offerings.get(c2, []):
+                if alt2 in sched[student] or alt2 == alt_ln:
+                    continue
+                return [(c2, alt_ln, alt2), (blocking_course, to_ln, alt_ln), (course, from_ln, to_ln)]
+    return None
 
-
-def build_course_line_students(long: pd.DataFrame) -> Dict[Tuple[str, str], List[str]]:
-    """
-    Returns mapping: (Course, Line) -> [student codes]
-    """
-    d = long.groupby(["Course", "Line"])["Code"].apply(list).to_dict()
-    return d
-
-
-def compute_balancing_moves_for_course(course: str, wide_counts: pd.DataFrame, course_line_students: Dict[Tuple[str, str], List[str]]) -> List[Dict]:
-    """
-    Balances a single course across its offering lines:
-    - Determine target (nearly equal) counts across lines where it is currently offered (non-zero only)
-    - Produce student-by-student move suggestions from surplus to deficit lines
-    """
-    if course not in wide_counts.index:
-        return []
-
-    line_counts = wide_counts.loc[course].dropna()
-    offering_lines = [ln for ln, ct in line_counts.items() if ct > 0]
-    if len(offering_lines) < 2:
-        return []
-
-    # Current counts
-    curr = {ln: int(line_counts[ln]) for ln in offering_lines}
-    total = sum(curr.values())
-    n = len(offering_lines)
-
-    base = total // n
-    remainder = total % n
-
-    # Fair target: sort by current ascending; first 'remainder' get base+1
-    lines_sorted_asc = sorted(offering_lines, key=lambda ln: curr[ln])
-    target = {ln: base for ln in offering_lines}
-    for ln in lines_sorted_asc[:remainder]:
-        target[ln] = base + 1
-
-    surplus = {ln: curr[ln] - target[ln] for ln in offering_lines if curr[ln] > target[ln]}
-    deficit = {ln: target[ln] - curr[ln] for ln in offering_lines if curr[ln] < target[ln]}
-    if sum(surplus.values()) == 0:
-        return []
-
-    # Build queues of students to move from surplus lines
-    surplus_queues = {
-        ln: deque(course_line_students.get((course, ln), [])[:surplus[ln]])
-        for ln in surplus
-    }
-
-    # Distribute greedily into deficits
+def compute_multi_move_plan_constrained(long_df, max_rounds=100, max_moves_per_student=3):
+    sched = build_student_schedule(long_df)
+    wide, offerings = build_offerings(long_df)
     moves = []
-    for to_ln, need in deficit.items():
-        remaining = need
-        for from_ln in list(surplus.keys()):
-            if surplus[from_ln] <= 0 or remaining <= 0:
+    improved = True
+    rounds = 0
+    moved_sc = set()
+    student_move_counts = defaultdict(int)
+    while improved and rounds < max_rounds:
+        improved = False
+        rounds += 1
+        counts = counts_from_long(long_df)
+        wide = counts.pivot(index='Course', columns='Line', values='StudentCount')
+        for course, row in wide.iterrows():
+            offered = [ln for ln, ct in row.dropna().items() if ct > 0]
+            if len(offered) < 2:
                 continue
-            take = min(surplus[from_ln], remaining)
-            for _ in range(take):
-                if surplus_queues[from_ln]:
-                    student = surplus_queues[from_ln].popleft()
-                    moves.append({
-                        "Course": course,
-                        "FromLine": from_ln,
-                        "ToLine": to_ln,
-                        "StudentCode": student
-                    })
-                    surplus[from_ln] -= 1
-                    remaining -= 1
-            if remaining == 0:
+            curr = {ln: int(row[ln]) for ln in offered}
+            total = sum(curr.values())
+            n = len(offered)
+            base = total // n
+            remainder = total % n
+            lines_sorted_asc = sorted(offered, key=lambda ln: curr[ln])
+            target = {ln: base for ln in offered}
+            for ln in lines_sorted_asc[:remainder]:
+                target[ln] = base + 1
+            surplus = [ln for ln in offered if curr[ln] > target[ln]]
+            deficit = [ln for ln in offered if curr[ln] < target[ln]]
+            if not surplus or not deficit:
+                continue
+            for to_ln in deficit:
+                need = target[to_ln] - curr[to_ln]
+                if need <= 0:
+                    continue
+                for from_ln in surplus:
+                    give = curr[from_ln] - target[from_ln]
+                    if give <= 0:
+                        continue
+                    candidates = long_df[(long_df['Course']==course) & (long_df['Line']==from_ln)]['Code'].tolist()
+                    moved_local = False
+                    for student in candidates:
+                        if student_move_counts[student] >= max_moves_per_student:
+                            continue
+                        if (student, course) in moved_sc:
+                            continue
+                        chain = plan_student_chain(student, course, from_ln, to_ln, sched, offerings, depth=2)
+                        if chain is None:
+                            continue
+                        proposed_courses = [c for (c, _, _) in chain]
+                        if any((student, c) in moved_sc for c in proposed_courses):
+                            continue
+                        if student_move_counts[student] + len(chain) > max_moves_per_student:
+                            continue
+                        valid = True
+                        for c, src_ln, dst_ln in chain:
+                            if sched[student].get(src_ln) != c or dst_ln in sched[student]:
+                                valid = False
+                                break
+                        if not valid:
+                            continue
+                        for c, src_ln, dst_ln in chain:
+                            sched[student].pop(src_ln, None)
+                            sched[student][dst_ln] = c
+                            mask = (long_df['Code']==student) & (long_df['Course']==c) & (long_df['Line']==src_ln)
+                            long_df.loc[mask, 'Line'] = dst_ln
+                            moves.append({'StudentCode': student, 'Course': c, 'FromLine': src_ln, 'ToLine': dst_ln})
+                            moved_sc.add((student, c))
+                            student_move_counts[student] += 1
+                        improved = True
+                        moved_local = True
+                        break
+                    if moved_local:
+                        break
+                if improved:
+                    break
+            if improved:
                 break
-    return moves
-
-
-def compute_all_moves(long: pd.DataFrame, wide_counts: pd.DataFrame, imbalance: pd.DataFrame, top_only: int = 0) -> pd.DataFrame:
-    """
-    Generate moves for all courses listed in `imbalance`.
-    If top_only > 0, restrict to the top N most imbalanced courses.
-    """
-    course_line_students = build_course_line_students(long)
-    courses = imbalance["Course"].tolist()
-    if top_only > 0:
-        courses = courses[:top_only]
-    all_moves: List[Dict] = []
-    for course in courses:
-        all_moves.extend(compute_balancing_moves_for_course(course, wide_counts, course_line_students))
-    moves_df = pd.DataFrame(all_moves, columns=["Course", "FromLine", "ToLine", "StudentCode"])
-    return moves_df
-
-
-def apply_moves_and_impact(long: pd.DataFrame, moves: pd.DataFrame) -> pd.DataFrame:
-    """Apply moves to the long dataframe and compute before/after/changes per course/line."""
-    before_counts = long.groupby(["Course", "Line"]).size().reset_index(name="Before")
-
-    if moves.empty:
-        after_counts = before_counts.rename(columns={"Before": "After"}).copy()
-    else:
-        long_after = long.copy()
-        # For each move, change the Line value for that student's row for that course
-        for _, r in moves.iterrows():
-            mask = (
-                (long_after["Code"] == r["StudentCode"]) &
-                (long_after["Course"] == r["Course"]) &
-                (long_after["Line"] == r["FromLine"])
-            )
-            long_after.loc[mask, "Line"] = r["ToLine"]
-        after_counts = long_after.groupby(["Course", "Line"]).size().reset_index(name="After")
-
-    impact = pd.merge(before_counts, after_counts, on=["Course", "Line"], how="outer").fillna(0)
-    impact["Before"] = impact["Before"].astype(int)
-    impact["After"] = impact["After"].astype(int)
-    impact["Change"] = impact["After"] - impact["Before"]
-    impact = impact.sort_values(["Course", "Line"]).reset_index(drop=True)
-    return impact
-
-
-def write_outputs(
-    outdir: str,
-    wide_counts: pd.DataFrame,
-    imbalance: pd.DataFrame,
-    moves: pd.DataFrame,
-    impact: pd.DataFrame,
-    write_excel: bool = True
-) -> Dict[str, str]:
-    os.makedirs(outdir, exist_ok=True)
-    paths = {}
-    # CSVs
-    wide_path = os.path.join(outdir, "counts_by_course_line.csv")
-    imb_path = os.path.join(outdir, "imbalanced_courses.csv")
-    moves_path = os.path.join(outdir, "move_suggestions.csv")
-    impact_path = os.path.join(outdir, "before_after_impact.csv")
-
-    wide_counts.to_csv(wide_path)
-    imbalance.to_csv(imb_path, index=False)
-    moves.to_csv(moves_path, index=False)
-    impact.to_csv(impact_path, index=False)
-
-    paths["counts_by_course_line"] = wide_path
-    paths["imbalanced_courses"] = imb_path
-    paths["move_suggestions"] = moves_path
-    paths["before_after_impact"] = impact_path
-
-    # Optional Excel workbook
-    if write_excel:
-        xlsx_path = os.path.join(outdir, "line_balance_reports.xlsx")
-        with pd.ExcelWriter(xlsx_path, engine="openpyxl") as xlw:
-            wide_counts.to_excel(xlw, sheet_name="CountsByCourseLine")
-            imbalance.to_excel(xlw, sheet_name="ImbalancedCourses", index=False)
-            moves.to_excel(xlw, sheet_name="MoveSuggestions", index=False)
-            impact.to_excel(xlw, sheet_name="BeforeAfterImpact", index=False)
-        paths["excel_workbook"] = xlsx_path
-
-    return paths
-
+    return pd.DataFrame(moves), long_df
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate line balance reports from student allocations CSV.")
-    parser.add_argument("--input", "-i", required=True, help="Path to the StudentAllocations CSV.")
-    parser.add_argument("--outdir", "-o", default="./out", help="Output directory (default: ./out).")
-    parser.add_argument("--min-lines", type=int, default=2, help="Minimum lines a course must appear in to be considered imbalanced (default: 2).")
-    parser.add_argument("--ignore-zeros", action="store_true", default=True, help="Ignore zeros when computing imbalance (default: True).")
-    parser.add_argument("--top-only", type=int, default=0, help="If > 0, only generate moves for top N imbalanced courses.")
-    parser.add_argument("--no-excel", action="store_true", help="Disable Excel workbook output.")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser(description="Line Balance Reports with optional multi-step planner.")
+    ap.add_argument("--input", "-i", required=True)
+    ap.add_argument("--outdir", "-o", default="./out")
+    ap.add_argument("--multi-move", action="store_true", help="Enable multi-step per-student move planner with safeguards")
+    ap.add_argument("--max-moves-per-student", type=int, default=3)
+    args = ap.parse_args()
 
-    long, alloc_cols = load_allocations(args.input)
-    counts = count_by_course_line(long)
-    wide_counts, imbalance = compute_imbalance(counts, ignore_zeros=args.ignore_zeros, min_lines=args.min_lines)
-    moves = compute_all_moves(long, wide_counts, imbalance, top_only=args.top_only)
-    impact = apply_moves_and_impact(long, moves)
+    df = pd.read_csv(args.input)
+    alloc_cols = [c for c in df.columns if str(c).startswith('AL')]
+    long0 = df.melt(id_vars=[c for c in df.columns if c not in alloc_cols], value_vars=alloc_cols, var_name='Line', value_name='Class')
+    long0 = long0.dropna(subset=['Class']).copy()
+    long0['Course'] = long0['Class'].astype(str).str[:5]
 
-    paths = write_outputs(
-        args.outdir,
-        wide_counts,
-        imbalance,
-        moves,
-        impact,
-        write_excel=(not args.no_excel)
-    )
+    wide0, _ = build_offerings(long0)
+    imb = compute_imbalance(wide0)
 
-    print("Reports generated:")
-    for k, v in paths.items():
-        print(f"- {k}: {v}")
+    if args.multi_move:
+        moves, long_after = compute_multi_move_plan_constrained(long0.copy(), max_rounds=200, max_moves_per_student=args.max_moves_per_student)
+    else:
+        moves = pd.DataFrame(columns=['StudentCode','Course','FromLine','ToLine'])
+        long_after = long0.copy()
 
+    before = long0.groupby(['Course','Line']).size().reset_index(name='Before')
+    after = long_after.groupby(['Course','Line']).size().reset_index(name='After')
+    impact = pd.merge(before, after, on=['Course','Line'], how='outer').fillna(0)
+    impact['Before'] = impact['Before'].astype(int)
+    impact['After'] = impact['After'].astype(int)
+    impact['Change'] = impact['After'] - impact['Before']
+    impact = impact.sort_values(['Course','Line']).reset_index(drop=True)
+
+    os.makedirs(args.outdir, exist_ok=True)
+    imb.to_csv(os.path.join(args.outdir, "imbalanced_courses.csv"), index=False)
+    moves.to_csv(os.path.join(args.outdir, "move_suggestions.csv"), index=False)
+    impact.to_csv(os.path.join(args.outdir, "before_after_impact.csv"), index=False)
+
+    # Optional Excel
+    try:
+        with pd.ExcelWriter(os.path.join(args.outdir, "line_balance_reports.xlsx"), engine="openpyxl") as xlw:
+            imb.to_excel(xlw, sheet_name="ImbalancedCourses", index=False)
+            moves.to_excel(xlw, sheet_name="MoveSuggestions", index=False)
+            impact.to_excel(xlw, sheet_name="BeforeAfterImpact", index=False)
+    except Exception as e:
+        print("Excel output skipped:", e)
 
 if __name__ == "__main__":
+    import os
     main()
